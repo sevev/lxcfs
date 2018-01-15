@@ -66,6 +66,7 @@ enum {
 	LXC_TYPE_PROC_STAT,
 	LXC_TYPE_PROC_DISKSTATS,
 	LXC_TYPE_PROC_SWAPS,
+	LXC_TYPE_SYS_CPUONLINE,
 };
 
 struct file_info {
@@ -139,6 +140,7 @@ static char **hierarchies;
  * another namespace using the *at() family of functions
  * {openat(), fchownat(), ...}. */
 static int *fd_hierarchies;
+static int cgroup_mount_ns_fd = -1;
 
 static void unlock_mutex(pthread_mutex_t *l)
 {
@@ -421,6 +423,7 @@ static void print_subsystems(void)
 {
 	int i;
 
+	fprintf(stderr, "mount namespace: %d\n", cgroup_mount_ns_fd);
 	fprintf(stderr, "hierarchies:\n");
 	for (i = 0; i < num_hierarchies; i++) {
 		if (hierarchies[i])
@@ -2959,23 +2962,23 @@ static void parse_memstat(char *memstat, unsigned long *cached,
 	char *eol;
 
 	while (*memstat) {
-		if (startswith(memstat, "cache")) {
-			sscanf(memstat + 5, "%lu", cached);
+		if (startswith(memstat, "total_cache")) {
+			sscanf(memstat + 11, "%lu", cached);
 			*cached /= 1024;
-		} else if (startswith(memstat, "active_anon")) {
-			sscanf(memstat + 11, "%lu", active_anon);
+		} else if (startswith(memstat, "total_active_anon")) {
+			sscanf(memstat + 17, "%lu", active_anon);
 			*active_anon /= 1024;
-		} else if (startswith(memstat, "inactive_anon")) {
-			sscanf(memstat + 13, "%lu", inactive_anon);
+		} else if (startswith(memstat, "total_inactive_anon")) {
+			sscanf(memstat + 19, "%lu", inactive_anon);
 			*inactive_anon /= 1024;
-		} else if (startswith(memstat, "active_file")) {
-			sscanf(memstat + 11, "%lu", active_file);
+		} else if (startswith(memstat, "total_active_file")) {
+			sscanf(memstat + 17, "%lu", active_file);
 			*active_file /= 1024;
-		} else if (startswith(memstat, "inactive_file")) {
-			sscanf(memstat + 13, "%lu", inactive_file);
+		} else if (startswith(memstat, "total_inactive_file")) {
+			sscanf(memstat + 19, "%lu", inactive_file);
 			*inactive_file /= 1024;
-		} else if (startswith(memstat, "unevictable")) {
-			sscanf(memstat + 11, "%lu", unevictable);
+		} else if (startswith(memstat, "total_unevictable")) {
+			sscanf(memstat + 17, "%lu", unevictable);
 			*unevictable /= 1024;
 		}
 		eol = strchr(memstat, '\n');
@@ -3165,7 +3168,7 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 			snprintf(lbuf, 100, "MemFree:        %8lu kB\n", memlimit - memusage);
 			printme = lbuf;
 		} else if (startswith(line, "MemAvailable:")) {
-			snprintf(lbuf, 100, "MemAvailable:   %8lu kB\n", memlimit - memusage);
+			snprintf(lbuf, 100, "MemAvailable:   %8lu kB\n", memlimit - memusage + cached);
 			printme = lbuf;
 		} else if (startswith(line, "SwapTotal:") && memswlimit > 0) {
 			sscanf(line+sizeof("SwapTotal:")-1, "%lu", &hostswtotal);
@@ -3589,24 +3592,6 @@ static uint64_t get_reaper_age(pid_t pid)
 	}
 
 	return procage;
-}
-
-static uint64_t get_reaper_btime(pid)
-{
-	int ret;
-	struct sysinfo sys;
-	uint64_t procstart;
-	uint64_t uptime;
-
-	ret = sysinfo(&sys);
-	if (ret < 0) {
-		lxcfs_debug("%s\n", "failed to retrieve system information");
-		return 0;
-	}
-
-	uptime = (uint64_t)time(NULL) - (uint64_t)sys.uptime;
-	procstart = get_reaper_start_time_in_sec(pid);
-	return uptime + procstart;
 }
 
 #define CPUALL_MAX_SIZE (BUF_RESERVE_SIZE / 2)
@@ -4477,6 +4462,19 @@ static bool permute_root(void)
 	return true;
 }
 
+static int preserve_mnt_ns(int pid)
+{
+	int ret;
+	size_t len = sizeof("/proc/") + 21 + sizeof("/ns/mnt");
+	char path[len];
+
+	ret = snprintf(path, len, "/proc/%d/ns/mnt", pid);
+	if (ret < 0 || (size_t)ret >= len)
+		return -1;
+
+	return open(path, O_RDONLY | O_CLOEXEC);
+}
+
 static bool cgfs_prepare_mounts(void)
 {
 	if (!mkdir_p(BASEDIR, 0700)) {
@@ -4491,6 +4489,12 @@ static bool cgfs_prepare_mounts(void)
 
 	if (unshare(CLONE_NEWNS) < 0) {
 		lxcfs_error("Failed to unshare mount namespace: %s.\n", strerror(errno));
+		return false;
+	}
+
+	cgroup_mount_ns_fd = preserve_mnt_ns(getpid());
+	if (cgroup_mount_ns_fd < 0) {
+		lxcfs_error("Failed to preserve mount namespace: %s.\n", strerror(errno));
 		return false;
 	}
 
@@ -4567,19 +4571,6 @@ static bool cgfs_setup_controllers(void)
 	return true;
 }
 
-static int preserve_ns(int pid)
-{
-	int ret;
-	size_t len = 5 /* /proc */ + 21 /* /int_as_str */ + 7 /* /ns/mnt */ + 1 /* \0 */;
-	char path[len];
-
-	ret = snprintf(path, len, "/proc/%d/ns/mnt", pid);
-	if (ret < 0 || (size_t)ret >= len)
-		return -1;
-
-	return open(path, O_RDONLY | O_CLOEXEC);
-}
-
 static void __attribute__((constructor)) collect_and_mount_subsystems(void)
 {
 	FILE *f;
@@ -4623,7 +4614,7 @@ static void __attribute__((constructor)) collect_and_mount_subsystems(void)
 	}
 
 	/* Preserve initial namespace. */
-	init_ns = preserve_ns(getpid());
+	init_ns = preserve_mnt_ns(getpid());
 	if (init_ns < 0) {
 		lxcfs_error("%s\n", "Failed to preserve initial mount namespace.");
 		goto out;
@@ -4680,4 +4671,234 @@ static void __attribute__((destructor)) free_subsystems(void)
 	}
 	free(hierarchies);
 	free(fd_hierarchies);
+
+	if (cgroup_mount_ns_fd >= 0)
+		close(cgroup_mount_ns_fd);
 }
+
+
+
+int sys_getattr(const char *path, struct stat *sb)
+{
+	struct timespec now;
+	memset(sb, 0, sizeof(struct stat));
+	if (clock_gettime(CLOCK_REALTIME, &now) < 0)
+		return -EINVAL;
+	sb->st_uid = sb->st_gid = 0;
+	sb->st_atim = sb->st_mtim = sb->st_ctim = now;
+	sb->st_size = 0;
+
+	if (strcmp(path, "/sys") == 0) {
+		sb->st_mode = S_IFDIR | 00755;
+		sb->st_nlink = 2;
+		return 0;
+	}
+
+	if (strcmp(path, "/sys/online") == 0) {
+
+		sb->st_size = 0;
+		sb->st_mode = S_IFREG | 00644;
+		sb->st_nlink = 1;
+		return 0;
+	}
+
+	return 0;
+}
+
+
+int sys_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
+		struct fuse_file_info *fi)
+{
+	if (filler(buf, ".", NULL, 0) != 0 ||
+	    filler(buf, "..", NULL, 0) != 0 ||
+	    filler(buf, "online", NULL, 0) != 0
+	    )
+		return -EINVAL;
+	return 0;
+}
+
+
+int sys_open(const char *path, struct fuse_file_info *fi)
+{
+	int type = -1;
+	struct file_info *info;
+
+	if (strcmp(path, "/sys/online") == 0)
+		type = LXC_TYPE_SYS_CPUONLINE;
+	if (type == -1)
+		return -ENOENT;
+
+	info = malloc(sizeof(*info));
+	if (!info)
+		return -ENOMEM;
+
+	memset(info, 0, sizeof(*info));
+	info->type = type;
+
+	info->buflen = get_procfile_size(path) + BUF_RESERVE_SIZE;
+	do {
+		info->buf = malloc(info->buflen);
+	} while (!info->buf);
+	memset(info->buf, 0, info->buflen);
+	/* set actual size to buffer size */
+	info->size = info->buflen;
+
+	fi->fh = (unsigned long)info;
+	return 0;
+}
+
+static int sys_cpuonline_read(char *buf, size_t size, off_t offset,
+		struct fuse_file_info *fi)
+{
+	struct fuse_context *fc = fuse_get_context();
+	struct file_info *d = (struct file_info *)fi->fh;
+	char *cg;
+	char *cpuset = NULL;
+	size_t total_len = 0, rv = 0;
+	int cpu_start = INT_MAX, cpu_end = INT_MAX;
+	char *cache = d->buf;
+	size_t cache_size = d->buflen;
+	char *answer = NULL;
+	ssize_t l;
+	FILE *f = NULL;
+
+	if (offset){
+		if (offset > d->size)
+			return -EINVAL;
+		if (!d->cached)
+			return 0;
+		int left = d->size - offset;
+		total_len = left > size ? size: left;
+		memcpy(buf, cache + offset, total_len);
+		return total_len;
+	}
+	pid_t initpid = lookup_initpid_in_store(fc->pid);
+	if (initpid <= 0)
+		initpid = fc->pid;
+	cg = get_pid_cgroup(initpid, "cpuset");
+
+	if (!cg)
+		return read_file("/sys/devices/system/cpu/online", buf, size, d);
+	prune_init_slice(cg);
+
+	cpuset = get_cpuset(cg);
+	printf("cpuset=%s\n", cpuset);
+
+	if (!cpuset)
+		goto err;
+	char *c1 = cpuset;
+	char *c2 = strchr(c1, ',');
+	int count = 0;
+	while(c2){
+		*c2 = '\0';
+		char *p1 = c1;
+		char *p2 = strchr(c1, '-');
+
+		if(p2){
+			*p2 = '\0';
+			p2++;
+			cpu_start = atoi(p1);
+			cpu_end = atoi(p2);
+			if(count == 0){
+				count += cpu_end - cpu_start;
+			}
+			else{
+				count += cpu_end - cpu_start + 1;
+			}
+			
+		}
+		else{
+			if(count == 0){
+
+			}
+			else{
+				count++;
+			}
+			
+		}
+		c2++;
+		c1 = c2;
+		c2 = strchr(c1, ',');
+	}
+	c2 = strchr(c1, '-');
+	if(c2){
+		*c2 = '\0';
+		c2++;
+		cpu_start = atoi(c1);
+		cpu_end = atoi(c2);
+		if(count == 0){
+			count += cpu_end - cpu_start;
+		}
+		else{
+			count += cpu_end - cpu_start + 1;
+		}
+	}
+	else{
+		if(count == 0){
+
+		}
+		else{
+			count++;
+		}
+	}
+	l = snprintf(cache, cache_size, "%d-%d\n", 0, count);
+	if (l < 0) {
+		perror("Error writing to cache");
+		rv = 0;
+		goto err;
+	}
+	if (l >= cache_size) {
+		lxcfs_error("%s\n", "Internal error: truncated write to cache.");
+		rv = 0;
+		goto err;
+	}
+	cache += l;
+	cache_size -= l;
+	total_len += l;
+	d->cached = 1;
+	d->size = total_len;
+	if (total_len > size ) total_len = size;
+	memcpy(buf, d->buf, total_len);
+	printf("buf=%s\n", buf);
+	rv = total_len;
+	printf("rv=%d\n", rv);
+
+	err:
+	if (f)
+		fclose(f);
+	free(cpuset);
+	free(cg);
+	return rv;	
+
+}
+
+int sys_read(const char *path, char *buf, size_t size, off_t offset,
+		struct fuse_file_info *fi)
+{
+	struct file_info *f = (struct file_info *) fi->fh;
+
+	switch (f->type) {
+	case LXC_TYPE_SYS_CPUONLINE:
+		return sys_cpuonline_read(buf, size, offset, fi);
+	default:
+		return -EINVAL;
+	}
+}
+
+int sys_access(const char *path, int mask)
+{
+	if (strcmp(path, "/sys") == 0 && access(path, R_OK) == 0)
+		return 0;
+
+	/* these are all read-only */
+	if ((mask & ~R_OK) != 0)
+		return -EACCES;
+	return 0;
+}
+
+int sys_release(const char *path, struct fuse_file_info *fi)
+{
+	do_release_file_info(fi);
+	return 0;
+}
+
