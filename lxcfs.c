@@ -1045,7 +1045,6 @@ int main(int argc, char *argv[])
 
 	if (!fuse_main(nargs, newargv, &lxcfs_ops, NULL))
 		ret = EXIT_SUCCESS;
-
 out:
 	if (dlopen_handle)
 		dlclose(dlopen_handle);
